@@ -137,8 +137,6 @@ const DIVISION_LIST: DivisionOption[] = [
   { id: "DIVISI PEMURNIAN AIR", zh: "制水车间" },
 ];
 
-const STORAGE_KEY = "qmb_env_til_002_history_v4";
-
 const A4_WIDTH_PX = 794;
 const A4_HEIGHT_PX = 1123;
 const A4_PADDING_Y = 24;
@@ -193,6 +191,7 @@ export default function QmbEnvRectificationPage() {
   const [cloudConnected, setCloudConnected] = useState<boolean>(
     Boolean(supabase)
   );
+  const [cloudErrorMsg, setCloudErrorMsg] = useState<string | null>(null);
   const [loadingCloud, setLoadingCloud] = useState<boolean>(false);
   const [exporting, setExporting] = useState<"png" | "pdf" | null>(null);
   const [logoError, setLogoError] = useState(false);
@@ -222,6 +221,7 @@ export default function QmbEnvRectificationPage() {
   const [approvedById, setApprovedById] = useState<string>("");
   const [checkedById, setCheckedById] = useState<string>("");
 
+  // 100% Supabase History
   const [history, setHistory] = useState<RectificationRecord[]>([]);
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [urgencyFilter, setUrgencyFilter] = useState<string>("all");
@@ -272,71 +272,57 @@ export default function QmbEnvRectificationPage() {
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
-  const syncFromSupabase = useCallback(
-    async (localRecords: RectificationRecord[]) => {
-      if (!supabase) {
-        setCloudConnected(false);
-        return;
-      }
-
-      setLoadingCloud(true);
-      try {
-        const { data, error } = await supabase
-          .from("rectification_reports")
-          .select("id, doc_no, payload, created_at")
-          .order("created_at", { ascending: false });
-
-        if (error) throw error;
-
-        setCloudConnected(true);
-
-        const cloudRecords: RectificationRecord[] = (data || [])
-          .map((row) => {
-            const payload = row.payload as RectificationRecord | null;
-            if (!payload) return null;
-            return {
-              ...payload,
-              id: row.id || payload.id,
-            };
-          })
-          .filter((item): item is RectificationRecord => item !== null);
-
-        const cloudDocSeqs = new Set(cloudRecords.map((r) => r.docSeq));
-        const localOnly = localRecords.filter(
-          (r) => !cloudDocSeqs.has(r.docSeq)
-        );
-        const merged = [...cloudRecords, ...localOnly];
-
-        setHistory(merged);
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
-        setDocSeq(getNextSeqFromRecords(merged));
-      } catch (err) {
-        console.error("Supabase fetch rectification error:", err);
-        setCloudConnected(false);
-      } finally {
-        setLoadingCloud(false);
-      }
-    },
-    []
-  );
-
-  useEffect(() => {
-    let parsedLocal: RectificationRecord[] = [];
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        parsedLocal = JSON.parse(raw);
-        setHistory(parsedLocal);
-        setDocSeq(getNextSeqFromRecords(parsedLocal));
-      } else {
-        setDocSeq("001");
-      }
-    } catch {
-      setDocSeq("001");
+  // Fetch 100% directly from Supabase Database
+  const fetchFromSupabase = useCallback(async (updateNextSeq = true) => {
+    if (!supabase) {
+      setCloudConnected(false);
+      setCloudErrorMsg(
+        "Variabel NEXT_PUBLIC_SUPABASE_URL / ANON_KEY belum dikonfigurasi."
+      );
+      return;
     }
 
-    syncFromSupabase(parsedLocal);
-  }, [syncFromSupabase]);
+    setLoadingCloud(true);
+    setCloudErrorMsg(null);
+    try {
+      const { data, error } = await supabase
+        .from("rectification_reports")
+        .select("id, doc_no, payload, created_at")
+        .order("created_at", { ascending: false });
+
+      if (error) throw error;
+
+      setCloudConnected(true);
+
+      const cloudRecords: RectificationRecord[] = (data || [])
+        .map((row) => {
+          const payload = row.payload as RectificationRecord | null;
+          if (!payload) return null;
+          return {
+            ...payload,
+            id: row.id || payload.id,
+          };
+        })
+        .filter((item): item is RectificationRecord => item !== null);
+
+      setHistory(cloudRecords);
+      if (updateNextSeq) {
+        setDocSeq(getNextSeqFromRecords(cloudRecords));
+      }
+    } catch (err: unknown) {
+      console.error("Supabase fetch rectification error:", err);
+      setCloudConnected(false);
+      const message =
+        err instanceof Error ? err.message : "Gagal terhubung ke Supabase";
+      setCloudErrorMsg(message);
+    } finally {
+      setLoadingCloud(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchFromSupabase(true);
+  }, [fetchFromSupabase]);
 
   const computePagination = useCallback(() => {
     const rawHazardLines = hazardDescription
@@ -622,7 +608,15 @@ export default function QmbEnvRectificationPage() {
     });
   };
 
-  const handleSaveToHistory = async () => {
+  // Save 100% directly to Supabase Storage + Supabase Database
+  const handleSaveToSupabase = async () => {
+    if (!supabase) {
+      alert(
+        "Koneksi Supabase belum aktif. Pastikan NEXT_PUBLIC_SUPABASE_URL dan NEXT_PUBLIC_SUPABASE_ANON_KEY sudah diatur."
+      );
+      return;
+    }
+
     if (!inspectedUnit.trim() || !hazardDescription.trim()) {
       alert(
         "Mohon isi minimal Unit yang Diperiksa dan Deskripsi Bahaya sebelum menyimpan. / 保存前请至少填写受检单位和隐患描述。"
@@ -631,104 +625,79 @@ export default function QmbEnvRectificationPage() {
     }
 
     setSaving(true);
+    setCloudErrorMsg(null);
     const cleanSeq = docSeq.trim() || "001";
     const docNo = `${DOC_PREFIX}${cleanSeq}`;
 
-    let finalBeforePhotos = [...beforePhotos];
-    let finalAfterPhotos = [...afterPhotos];
-
-    if (supabase) {
-      try {
-        finalBeforePhotos = await Promise.all(
+    try {
+      // 1. Upload all new base64 photos strictly to Supabase Storage
+      const [finalBeforePhotos, finalAfterPhotos] = await Promise.all([
+        Promise.all(
           beforePhotos.map((src) =>
             uploadPhotoToSupabase(src, "rectification")
           )
-        );
-        finalAfterPhotos = await Promise.all(
+        ),
+        Promise.all(
           afterPhotos.map((src) =>
             uploadPhotoToSupabase(src, "rectification")
           )
-        );
-        setBeforePhotos(finalBeforePhotos);
-        setAfterPhotos(finalAfterPhotos);
-      } catch (uploadErr) {
-        console.warn("Gagal mengunggah foto ke Storage, menyimpan cadangan lokal:", uploadErr);
-      }
+        ),
+      ]);
+
+      setBeforePhotos(finalBeforePhotos);
+      setAfterPhotos(finalAfterPhotos);
+
+      const existingItem = history.find((item) => item.docSeq === cleanSeq);
+      const newRecord: RectificationRecord = {
+        id:
+          existingItem?.id ||
+          (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())),
+        docSeq: cleanSeq,
+        revNo,
+        issueDate,
+        inspectedUnit,
+        picName,
+        inspectors: selectedInspectors,
+        inspectionDate,
+        urgency,
+        deadline,
+        hazardDescription,
+        rectificationRecommendation,
+        beforePhotos: finalBeforePhotos,
+        afterPhotos: finalAfterPhotos,
+        approvedById,
+        checkedById,
+        createdAt: existingItem?.createdAt || new Date().toISOString(),
+      };
+
+      // 2. Upsert strictly to Supabase Table
+      const { error } = await supabase.from("rectification_reports").upsert(
+        {
+          doc_no: docNo,
+          unit_area: inspectedUnit,
+          inspection_date: inspectionDate,
+          status: urgency,
+          payload: newRecord,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "doc_no" }
+      );
+
+      if (error) throw error;
+
+      setCloudConnected(true);
+      await fetchFromSupabase(false);
+      setSavedToast("Tersimpan ke Supabase! / 已保存到云端！");
+      setTimeout(() => setSavedToast(null), 3000);
+    } catch (err: unknown) {
+      console.error("Supabase save rectification error:", err);
+      const message =
+        err instanceof Error ? err.message : "Gagal menyimpan ke Supabase.";
+      setCloudErrorMsg(message);
+      alert(`Gagal menyimpan ke database Supabase:\n${message}`);
+    } finally {
+      setSaving(false);
     }
-
-    const existingItem = history.find((item) => item.docSeq === cleanSeq);
-    const newRecord: RectificationRecord = {
-      id:
-        existingItem?.id ||
-        (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())),
-      docSeq: cleanSeq,
-      revNo,
-      issueDate,
-      inspectedUnit,
-      picName,
-      inspectors: selectedInspectors,
-      inspectionDate,
-      urgency,
-      deadline,
-      hazardDescription,
-      rectificationRecommendation,
-      beforePhotos: finalBeforePhotos,
-      afterPhotos: finalAfterPhotos,
-      approvedById,
-      checkedById,
-      createdAt: existingItem?.createdAt || new Date().toISOString(),
-    };
-
-    const localUpdated = [
-      newRecord,
-      ...history.filter((item) => item.docSeq !== cleanSeq),
-    ];
-    setHistory(localUpdated);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(localUpdated));
-
-    if (supabase) {
-      try {
-        const { data, error } = await supabase
-          .from("rectification_reports")
-          .upsert(
-            {
-              doc_no: docNo,
-              unit_area: inspectedUnit,
-              inspection_date: inspectionDate,
-              status: urgency,
-              payload: newRecord,
-              updated_at: new Date().toISOString(),
-            },
-            { onConflict: "doc_no" }
-          )
-          .select("id")
-          .single();
-
-        if (error) throw error;
-
-        if (data?.id) {
-          newRecord.id = data.id;
-          const syncedList = [
-            newRecord,
-            ...history.filter((item) => item.docSeq !== cleanSeq),
-          ];
-          setHistory(syncedList);
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(syncedList));
-        }
-
-        setCloudConnected(true);
-        setSavedToast("Tersimpan ke Cloud! / 已保存到云端！");
-      } catch (dbErr) {
-        console.error("Supabase save rectification error:", dbErr);
-        setCloudConnected(false);
-        setSavedToast("Tersimpan di Lokal / 已本地保存");
-      }
-    } else {
-      setSavedToast("Tersimpan di Lokal / 已本地保存");
-    }
-
-    setSaving(false);
-    setTimeout(() => setSavedToast(null), 3000);
   };
 
   const loadRecord = (rec: RectificationRecord) => {
@@ -750,24 +719,31 @@ export default function QmbEnvRectificationPage() {
   };
 
   const deleteRecord = async (rec: RectificationRecord) => {
-    const updated = history.filter((item) => item.docSeq !== rec.docSeq);
-    setHistory(updated);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
+    if (!supabase) {
+      alert("Koneksi Supabase belum aktif.");
+      return;
+    }
 
-    if (supabase) {
-      try {
-        const docNo = `${DOC_PREFIX}${rec.docSeq}`;
-        const { error } = await supabase
-          .from("rectification_reports")
-          .delete()
-          .eq("doc_no", docNo);
+    const docNo = `${DOC_PREFIX}${rec.docSeq}`;
+    const confirmed = window.confirm(
+      `Hapus permohonan ${docNo} secara permanen dari database? / 确定要从数据库永久删除通知单 ${docNo} 吗？`
+    );
+    if (!confirmed) return;
 
-        if (error) throw error;
-        setCloudConnected(true);
-      } catch (err) {
-        console.error("Supabase delete rectification error:", err);
-        setCloudConnected(false);
-      }
+    try {
+      const { error } = await supabase
+        .from("rectification_reports")
+        .delete()
+        .eq("doc_no", docNo);
+
+      if (error) throw error;
+
+      setHistory((prev) => prev.filter((item) => item.docSeq !== rec.docSeq));
+    } catch (err: unknown) {
+      console.error("Supabase delete rectification error:", err);
+      const message =
+        err instanceof Error ? err.message : "Gagal menghapus data.";
+      alert(`Gagal menghapus dari Supabase:\n${message}`);
     }
   };
 
@@ -1031,30 +1007,36 @@ Mohon segera ditindaklanjuti sebelum tenggat waktu. / 请责任单位按期完�
           <div className="p-5 space-y-4">
             {/* Group 1: Kontrol Dokumen */}
             <div className="p-3.5 rounded-xl bg-[#FFFDF8] border border-[#5DA295]/25 space-y-2.5">
-              <div className="flex items-center justify-between">
+              <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="text-[11px] font-bold uppercase tracking-wider text-[#3e776c]">
                   Kontrol Dokumen / 文件控制信息
                 </span>
                 <span
-                  className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold ${
+                  className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-semibold ${
                     cloudConnected
                       ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
-                      : "bg-amber-50 text-amber-700 border border-amber-200"
+                      : "bg-rose-50 text-rose-700 border border-rose-200"
                   }`}
                 >
                   {cloudConnected ? (
                     <>
                       <Cloud className="w-3 h-3" />
-                      Supabase Cloud Aktif
+                      100% Supabase Cloud Terhubung
                     </>
                   ) : (
                     <>
                       <CloudOff className="w-3 h-3" />
-                      Mode Lokal (Offline)
+                      Supabase Terputus / Belum Terkonfigurasi
                     </>
                   )}
                 </span>
               </div>
+
+              {cloudErrorMsg && (
+                <div className="p-2.5 rounded-lg bg-rose-50 border border-rose-200 text-rose-700 text-xs">
+                  <strong>Status Koneksi Database:</strong> {cloudErrorMsg}
+                </div>
+              )}
 
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1">
@@ -1503,8 +1485,8 @@ Mohon segera ditindaklanjuti sebelum tenggat waktu. / 请责任单位按期完�
           <div className="bg-white p-4 rounded-2xl border border-[#5DA295]/25 shadow-sm flex flex-wrap items-center justify-between gap-3">
             <button
               type="button"
-              onClick={handleSaveToHistory}
-              disabled={saving}
+              onClick={handleSaveToSupabase}
+              disabled={saving || !cloudConnected}
               className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-[#5DA295] hover:bg-[#4c8b7f] text-white text-xs font-bold shadow-xs transition cursor-pointer disabled:opacity-60"
             >
               {savedToast ? (
@@ -1513,10 +1495,10 @@ Mohon segera ditindaklanjuti sebelum tenggat waktu. / 请责任单位按期完�
                 <Save className="w-4 h-4" />
               )}
               {saving
-                ? "Menyimpan ke Cloud... / 正在保存..."
+                ? "Mengunggah & Menyimpan... / 正在保存..."
                 : savedToast
                 ? savedToast
-                : "Simpan ke Riwayat / 保存记录"}
+                : "Simpan ke Supabase / 保存到云端"}
             </button>
 
             <div className="flex flex-wrap items-center gap-2.5">
@@ -2645,21 +2627,27 @@ Mohon segera ditindaklanjuti sebelum tenggat waktu. / 请责任单位按期完�
           </div>
         </section>
 
-        {/* SECTION 3 (BOTTOM): Saved Cloud & Local History */}
+        {/* SECTION 3 (BOTTOM): Riwayat Permohonan 100% Supabase */}
         <section className="bg-white rounded-2xl border border-[#5DA295]/25 shadow-sm overflow-hidden">
           <div className="px-5 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
             <div className="flex items-center gap-2">
               <FolderOpen className="w-5 h-5 text-[#5DA295]" />
               <h3 className="font-bold text-slate-900 text-sm sm:text-base">
-                Riwayat Permohonan Tersimpan{" "}
-                {cloudConnected ? "(Cloud Supabase)" : "(Lokal)"} / 已保存整改通知单 (
+                Riwayat Permohonan Tersimpan (Supabase Cloud) / 云端已保存整改通知单 (
                 {filteredHistory.length})
               </h3>
-              {loadingCloud && (
-                <span className="text-[11px] text-[#3e776c] animate-pulse">
-                  Memuat...
-                </span>
-              )}
+              <button
+                type="button"
+                onClick={() => fetchFromSupabase(false)}
+                disabled={loadingCloud}
+                title="Muat ulang data dari Supabase"
+                className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-[11px] font-semibold cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw
+                  className={`w-3 h-3 ${loadingCloud ? "animate-spin" : ""}`}
+                />
+                Refresh
+              </button>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
@@ -2687,11 +2675,15 @@ Mohon segera ditindaklanjuti sebelum tenggat waktu. / 请责任单位按期完�
             </div>
           </div>
 
-          {filteredHistory.length === 0 ? (
+          {loadingCloud && filteredHistory.length === 0 ? (
             <div className="p-8 text-center text-xs text-slate-500">
-              Belum ada data tersimpan. Klik tombol &ldquo;Simpan ke Riwayat /
-              保存记录&rdquo; untuk menyimpan permohonan. /
-              暂无保存记录，点击“保存记录”按钮即可保存通知单。
+              Mengambil data dari database Supabase... / 正在从云端加载记录...
+            </div>
+          ) : filteredHistory.length === 0 ? (
+            <div className="p-8 text-center text-xs text-slate-500">
+              Belum ada permohonan perbaikan di database Supabase. Klik
+              &ldquo;Simpan ke Supabase / 保存到云端&rdquo; untuk menyimpan. /
+              云端暂无保存记录，点击“保存到云端”按钮即可保存通知单。
             </div>
           ) : (
             <div className="overflow-x-auto">
