@@ -1021,12 +1021,12 @@ Mohon segera ditindaklanjuti sebelum tenggat waktu. / 请责任单位按期完�
                   {cloudConnected ? (
                     <>
                       <Cloud className="w-3 h-3" />
-                      100% Supabase Cloud Terhubung
+                      Supabase Cloud On
                     </>
                   ) : (
                     <>
                       <CloudOff className="w-3 h-3" />
-                      Supabase Terputus / Belum Terkonfigurasi
+                      Supabase Cloud Off
                     </>
                   )}
                 </span>

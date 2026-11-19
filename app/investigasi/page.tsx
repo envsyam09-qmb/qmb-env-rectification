@@ -1431,12 +1431,12 @@ ${rootCause || "-"}
                   {cloudConnected ? (
                     <>
                       <Cloud className="w-3 h-3" />
-                      Supabase Cloud Aktif
+                      Supabase Cloud On
                     </>
                   ) : (
                     <>
                       <CloudOff className="w-3 h-3" />
-                      Supabase Terputus
+                      Supabase Cloud Off
                     </>
                   )}
                 </span>
