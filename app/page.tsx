@@ -23,10 +23,13 @@ import {
   ChevronDown,
   X,
   RotateCcw,
+  Cloud,
+  CloudOff,
 } from "lucide-react";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 import TopNavHeader from "../components/TopNavHeader";
+import { supabase, uploadPhotoToSupabase } from "../lib/supabase";
 
 type UrgencyLevel = "urgent" | "medium" | "normal";
 
@@ -174,9 +177,23 @@ function formatSeq(num: number): string {
   return String(num).padStart(3, "0");
 }
 
+function getNextSeqFromRecords(records: RectificationRecord[]): string {
+  if (records.length === 0) return "001";
+  const maxNum = records.reduce((max, item) => {
+    const parsed = parseInt(item.docSeq, 10);
+    return !Number.isNaN(parsed) && parsed > max ? parsed : max;
+  }, 0);
+  return formatSeq(maxNum + 1);
+}
+
 export default function QmbEnvRectificationPage() {
   const [copiedWeChat, setCopiedWeChat] = useState(false);
-  const [savedToast, setSavedToast] = useState(false);
+  const [savedToast, setSavedToast] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [cloudConnected, setCloudConnected] = useState<boolean>(
+    Boolean(supabase)
+  );
+  const [loadingCloud, setLoadingCloud] = useState<boolean>(false);
   const [exporting, setExporting] = useState<"png" | "pdf" | null>(null);
   const [logoError, setLogoError] = useState(false);
   const [sigErrors, setSigErrors] = useState<Record<string, boolean>>({});
@@ -255,20 +272,71 @@ export default function QmbEnvRectificationPage() {
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
+  const syncFromSupabase = useCallback(
+    async (localRecords: RectificationRecord[]) => {
+      if (!supabase) {
+        setCloudConnected(false);
+        return;
+      }
+
+      setLoadingCloud(true);
+      try {
+        const { data, error } = await supabase
+          .from("rectification_reports")
+          .select("id, doc_no, payload, created_at")
+          .order("created_at", { ascending: false });
+
+        if (error) throw error;
+
+        setCloudConnected(true);
+
+        const cloudRecords: RectificationRecord[] = (data || [])
+          .map((row) => {
+            const payload = row.payload as RectificationRecord | null;
+            if (!payload) return null;
+            return {
+              ...payload,
+              id: row.id || payload.id,
+            };
+          })
+          .filter((item): item is RectificationRecord => item !== null);
+
+        const cloudDocSeqs = new Set(cloudRecords.map((r) => r.docSeq));
+        const localOnly = localRecords.filter(
+          (r) => !cloudDocSeqs.has(r.docSeq)
+        );
+        const merged = [...cloudRecords, ...localOnly];
+
+        setHistory(merged);
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
+        setDocSeq(getNextSeqFromRecords(merged));
+      } catch (err) {
+        console.error("Supabase fetch rectification error:", err);
+        setCloudConnected(false);
+      } finally {
+        setLoadingCloud(false);
+      }
+    },
+    []
+  );
+
   useEffect(() => {
+    let parsedLocal: RectificationRecord[] = [];
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
-        const parsed: RectificationRecord[] = JSON.parse(raw);
-        setHistory(parsed);
-        setDocSeq(formatSeq(parsed.length + 1));
+        parsedLocal = JSON.parse(raw);
+        setHistory(parsedLocal);
+        setDocSeq(getNextSeqFromRecords(parsedLocal));
       } else {
         setDocSeq("001");
       }
     } catch {
       setDocSeq("001");
     }
-  }, []);
+
+    syncFromSupabase(parsedLocal);
+  }, [syncFromSupabase]);
 
   const computePagination = useCallback(() => {
     const rawHazardLines = hazardDescription
@@ -503,7 +571,7 @@ export default function QmbEnvRectificationPage() {
 
   const resetForm = () => {
     const today = getTodayIso();
-    setDocSeq(formatSeq(history.length + 1));
+    setDocSeq(getNextSeqFromRecords(history));
     setInspectedUnit("");
     setUnitSearch("");
     setPicName("");
@@ -554,7 +622,7 @@ export default function QmbEnvRectificationPage() {
     });
   };
 
-  const handleSaveToHistory = () => {
+  const handleSaveToHistory = async () => {
     if (!inspectedUnit.trim() || !hazardDescription.trim()) {
       alert(
         "Mohon isi minimal Unit yang Diperiksa dan Deskripsi Bahaya sebelum menyimpan. / 保存前请至少填写受检单位和隐患描述。"
@@ -562,9 +630,37 @@ export default function QmbEnvRectificationPage() {
       return;
     }
 
+    setSaving(true);
     const cleanSeq = docSeq.trim() || "001";
+    const docNo = `${DOC_PREFIX}${cleanSeq}`;
+
+    let finalBeforePhotos = [...beforePhotos];
+    let finalAfterPhotos = [...afterPhotos];
+
+    if (supabase) {
+      try {
+        finalBeforePhotos = await Promise.all(
+          beforePhotos.map((src) =>
+            uploadPhotoToSupabase(src, "rectification")
+          )
+        );
+        finalAfterPhotos = await Promise.all(
+          afterPhotos.map((src) =>
+            uploadPhotoToSupabase(src, "rectification")
+          )
+        );
+        setBeforePhotos(finalBeforePhotos);
+        setAfterPhotos(finalAfterPhotos);
+      } catch (uploadErr) {
+        console.warn("Gagal mengunggah foto ke Storage, menyimpan cadangan lokal:", uploadErr);
+      }
+    }
+
+    const existingItem = history.find((item) => item.docSeq === cleanSeq);
     const newRecord: RectificationRecord = {
-      id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
+      id:
+        existingItem?.id ||
+        (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())),
       docSeq: cleanSeq,
       revNo,
       issueDate,
@@ -576,21 +672,63 @@ export default function QmbEnvRectificationPage() {
       deadline,
       hazardDescription,
       rectificationRecommendation,
-      beforePhotos,
-      afterPhotos,
+      beforePhotos: finalBeforePhotos,
+      afterPhotos: finalAfterPhotos,
       approvedById,
       checkedById,
-      createdAt: new Date().toISOString(),
+      createdAt: existingItem?.createdAt || new Date().toISOString(),
     };
 
-    const updated = [
+    const localUpdated = [
       newRecord,
       ...history.filter((item) => item.docSeq !== cleanSeq),
     ];
-    setHistory(updated);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
-    setSavedToast(true);
-    setTimeout(() => setSavedToast(false), 2500);
+    setHistory(localUpdated);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(localUpdated));
+
+    if (supabase) {
+      try {
+        const { data, error } = await supabase
+          .from("rectification_reports")
+          .upsert(
+            {
+              doc_no: docNo,
+              unit_area: inspectedUnit,
+              inspection_date: inspectionDate,
+              status: urgency,
+              payload: newRecord,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: "doc_no" }
+          )
+          .select("id")
+          .single();
+
+        if (error) throw error;
+
+        if (data?.id) {
+          newRecord.id = data.id;
+          const syncedList = [
+            newRecord,
+            ...history.filter((item) => item.docSeq !== cleanSeq),
+          ];
+          setHistory(syncedList);
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(syncedList));
+        }
+
+        setCloudConnected(true);
+        setSavedToast("Tersimpan ke Cloud! / 已保存到云端！");
+      } catch (dbErr) {
+        console.error("Supabase save rectification error:", dbErr);
+        setCloudConnected(false);
+        setSavedToast("Tersimpan di Lokal / 已本地保存");
+      }
+    } else {
+      setSavedToast("Tersimpan di Lokal / 已本地保存");
+    }
+
+    setSaving(false);
+    setTimeout(() => setSavedToast(null), 3000);
   };
 
   const loadRecord = (rec: RectificationRecord) => {
@@ -611,10 +749,26 @@ export default function QmbEnvRectificationPage() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
-  const deleteRecord = (id: string) => {
-    const updated = history.filter((item) => item.id !== id);
+  const deleteRecord = async (rec: RectificationRecord) => {
+    const updated = history.filter((item) => item.docSeq !== rec.docSeq);
     setHistory(updated);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
+
+    if (supabase) {
+      try {
+        const docNo = `${DOC_PREFIX}${rec.docSeq}`;
+        const { error } = await supabase
+          .from("rectification_reports")
+          .delete()
+          .eq("doc_no", docNo);
+
+        if (error) throw error;
+        setCloudConnected(true);
+      } catch (err) {
+        console.error("Supabase delete rectification error:", err);
+        setCloudConnected(false);
+      }
+    }
   };
 
   const handleExportPNG = async () => {
@@ -842,7 +996,7 @@ Mohon segera ditindaklanjuti sebelum tenggat waktu. / 请责任单位按期完�
 
       {/* Shared Sticky Top Bar */}
       <TopNavHeader />
-      
+
       {/* Main Vertical Stacked Workspace */}
       <main className="max-w-5xl mx-auto px-4 sm:px-6 pt-6 space-y-6">
         {/* SECTION 1 (TOP): Input Form */}
@@ -872,13 +1026,34 @@ Mohon segera ditindaklanjuti sebelum tenggat waktu. / 请责任单位按期完�
                 Reset Cepat / 快速重置
               </button>
             </div>
-            </div>
+          </div>
 
           <div className="p-5 space-y-4">
             {/* Group 1: Kontrol Dokumen */}
             <div className="p-3.5 rounded-xl bg-[#FFFDF8] border border-[#5DA295]/25 space-y-2.5">
-              <div className="text-[11px] font-bold uppercase tracking-wider text-[#3e776c]">
-                Kontrol Dokumen / 文件控制信息
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-bold uppercase tracking-wider text-[#3e776c]">
+                  Kontrol Dokumen / 文件控制信息
+                </span>
+                <span
+                  className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold ${
+                    cloudConnected
+                      ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                      : "bg-amber-50 text-amber-700 border border-amber-200"
+                  }`}
+                >
+                  {cloudConnected ? (
+                    <>
+                      <Cloud className="w-3 h-3" />
+                      Supabase Cloud Aktif
+                    </>
+                  ) : (
+                    <>
+                      <CloudOff className="w-3 h-3" />
+                      Mode Lokal (Offline)
+                    </>
+                  )}
+                </span>
               </div>
 
               <div>
@@ -968,7 +1143,8 @@ Mohon segera ditindaklanjuti sebelum tenggat waktu. / 请责任单位按期完�
                     <div className="max-h-64 overflow-y-auto divide-y divide-slate-100">
                       {filteredDivisions.length === 0 ? (
                         <div className="p-3 text-center text-[11px] text-slate-500">
-                          Tidak ditemukan. Anda tetap bisa mengetik manual di kolom atas.
+                          Tidak ditemukan. Anda tetap bisa mengetik manual di
+                          kolom atas.
                         </div>
                       ) : (
                         filteredDivisions.map((div, idx) => {
@@ -1328,15 +1504,18 @@ Mohon segera ditindaklanjuti sebelum tenggat waktu. / 请责任单位按期完�
             <button
               type="button"
               onClick={handleSaveToHistory}
-              className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-[#5DA295] hover:bg-[#4c8b7f] text-white text-xs font-bold shadow-xs transition cursor-pointer"
+              disabled={saving}
+              className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-[#5DA295] hover:bg-[#4c8b7f] text-white text-xs font-bold shadow-xs transition cursor-pointer disabled:opacity-60"
             >
               {savedToast ? (
                 <Check className="w-4 h-4" />
               ) : (
                 <Save className="w-4 h-4" />
               )}
-              {savedToast
-                ? "Tersimpan! / 已保存！"
+              {saving
+                ? "Menyimpan ke Cloud... / 正在保存..."
+                : savedToast
+                ? savedToast
                 : "Simpan ke Riwayat / 保存记录"}
             </button>
 
@@ -2176,6 +2355,11 @@ Mohon segera ditindaklanjuti sebelum tenggat waktu. / 请责任单位按期完�
                                         <img
                                           src={src}
                                           alt={`Temuan ${pIdx + 1}`}
+                                          crossOrigin={
+                                            src.startsWith("http")
+                                              ? "anonymous"
+                                              : undefined
+                                          }
                                           style={{
                                             maxWidth: "100%",
                                             maxHeight: "100%",
@@ -2249,6 +2433,11 @@ Mohon segera ditindaklanjuti sebelum tenggat waktu. / 请责任单位按期完�
                                         <img
                                           src={src}
                                           alt={`Perbaikan ${pIdx + 1}`}
+                                          crossOrigin={
+                                            src.startsWith("http")
+                                              ? "anonymous"
+                                              : undefined
+                                          }
                                           style={{
                                             maxWidth: "100%",
                                             maxHeight: "100%",
@@ -2456,15 +2645,21 @@ Mohon segera ditindaklanjuti sebelum tenggat waktu. / 请责任单位按期完�
           </div>
         </section>
 
-        {/* SECTION 3 (BOTTOM): Saved Local History */}
+        {/* SECTION 3 (BOTTOM): Saved Cloud & Local History */}
         <section className="bg-white rounded-2xl border border-[#5DA295]/25 shadow-sm overflow-hidden">
           <div className="px-5 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
             <div className="flex items-center gap-2">
               <FolderOpen className="w-5 h-5 text-[#5DA295]" />
               <h3 className="font-bold text-slate-900 text-sm sm:text-base">
-                Riwayat Permohonan Tersimpan (Lokal) / 本地已保存整改通知单 (
+                Riwayat Permohonan Tersimpan{" "}
+                {cloudConnected ? "(Cloud Supabase)" : "(Lokal)"} / 已保存整改通知单 (
                 {filteredHistory.length})
               </h3>
+              {loadingCloud && (
+                <span className="text-[11px] text-[#3e776c] animate-pulse">
+                  Memuat...
+                </span>
+              )}
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
@@ -2494,7 +2689,9 @@ Mohon segera ditindaklanjuti sebelum tenggat waktu. / 请责任单位按期完�
 
           {filteredHistory.length === 0 ? (
             <div className="p-8 text-center text-xs text-slate-500">
-              Belum ada data tersimpan. Klik tombol &ldquo;Simpan ke Riwayat / 保存记录&rdquo; untuk menyimpan permohonan. / 暂无保存记录，点击“保存记录”按钮即可暂存通知单。
+              Belum ada data tersimpan. Klik tombol &ldquo;Simpan ke Riwayat /
+              保存记录&rdquo; untuk menyimpan permohonan. /
+              暂无保存记录，点击“保存记录”按钮即可保存通知单。
             </div>
           ) : (
             <div className="overflow-x-auto">
@@ -2550,7 +2747,7 @@ Mohon segera ditindaklanjuti sebelum tenggat waktu. / 请责任单位按期完�
                         </button>
                         <button
                           type="button"
-                          onClick={() => deleteRecord(item.id)}
+                          onClick={() => deleteRecord(item)}
                           className="px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 font-semibold cursor-pointer"
                         >
                           Hapus / 删除

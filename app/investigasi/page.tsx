@@ -23,10 +23,14 @@ import {
   X,
   Plus,
   RotateCcw,
+  Cloud,
+  CloudOff,
+  RefreshCw,
 } from "lucide-react";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 import TopNavHeader from "../../components/TopNavHeader";
+import { supabase, uploadPhotoToSupabase } from "../../lib/supabase";
 
 interface SupervisorOption {
   id: string;
@@ -138,10 +142,7 @@ const ALL_SIGNERS: SupervisorOption[] = [
   },
 ];
 
-// Opsi khusus kolom Dibuat Oleh (termasuk Sukardi Syam)
 const PREPARED_BY_OPTIONS = ALL_SIGNERS;
-
-// Opsi kolom Diperiksa Oleh & Disetujui Oleh (tanpa Sukardi Syam)
 const REVIEW_APPROVE_OPTIONS = ALL_SIGNERS.filter(
   (s) => s.id !== "sukardi-syam"
 );
@@ -192,8 +193,6 @@ const DIVISION_LIST: DivisionOption[] = [
   { id: "DIVISI PEMURNIAN AIR", zh: "制水车间" },
 ];
 
-const STORAGE_KEY = "qmb_env_til_003_history_v2";
-
 // Exact A4 dimensions at 96 DPI (210mm x 297mm)
 const A4_WIDTH_PX = 794;
 const A4_HEIGHT_PX = 1123;
@@ -201,7 +200,6 @@ const A4_PADDING_Y = 14;
 const A4_PADDING_X = 22;
 const PRINTABLE_HEIGHT = A4_HEIGHT_PX - A4_PADDING_Y * 2; // 1095px
 
-// Calibrated heights so empty / concise report fits 100% on 1 A4 page including Pengesahan
 const HEADER_HEIGHT = 122;
 const SEC1_HEIGHT = 88;
 const SEC2_BANNER_HEIGHT = 22;
@@ -234,9 +232,30 @@ function getDefaultDateTime(): string {
   return `${y}.${m}.${d} ${hh}:${mm}`;
 }
 
+function getNextReportNoFromRecords(records: InvestigationRecord[]): string {
+  if (records.length === 0) return "INV-ENV-2026-001";
+  const maxNum = records.reduce((max, item) => {
+    const match = item.reportNo.match(/(\d+)$/);
+    if (!match) return max;
+    const parsed = parseInt(match[1], 10);
+    return !Number.isNaN(parsed) && parsed > max ? parsed : max;
+  }, 0);
+  const nextSeq = String(Math.max(maxNum + 1, records.length + 1)).padStart(
+    3,
+    "0"
+  );
+  return `INV-ENV-2026-${nextSeq}`;
+}
+
 export default function QmbEnvInvestigationPage() {
   const [copiedWeChat, setCopiedWeChat] = useState(false);
-  const [savedToast, setSavedToast] = useState(false);
+  const [savedToast, setSavedToast] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [cloudConnected, setCloudConnected] = useState<boolean>(
+    Boolean(supabase)
+  );
+  const [cloudErrorMsg, setCloudErrorMsg] = useState<string | null>(null);
+  const [loadingCloud, setLoadingCloud] = useState<boolean>(false);
   const [exporting, setExporting] = useState<"png" | "pdf" | null>(null);
   const [logoError, setLogoError] = useState(false);
   const [sigErrors, setSigErrors] = useState<Record<string, boolean>>({});
@@ -265,7 +284,7 @@ export default function QmbEnvInvestigationPage() {
   );
   const [rootCause, setRootCause] = useState<string>("");
 
-  // Section 3: Dokumentasi Visual Lapangan (Max 3 photos stacked vertically per category)
+  // Section 3: Dokumentasi Visual Lapangan
   const [sourcePhotos, setSourcePhotos] = useState<string[]>([]);
   const [sourceCaption, setSourceCaption] = useState<string>("");
   const [impactedPhotos, setImpactedPhotos] = useState<string[]>([]);
@@ -294,7 +313,7 @@ export default function QmbEnvInvestigationPage() {
     date: getTodayDotDate(),
   });
 
-  // Local History
+  // Cloud History (100% Supabase)
   const [history, setHistory] = useState<InvestigationRecord[]>([]);
   const [searchQuery, setSearchQuery] = useState<string>("");
 
@@ -322,7 +341,6 @@ export default function QmbEnvInvestigationPage() {
   const locDropdownRef = useRef<HTMLDivElement>(null);
   const deptDropdownRef = useRef<HTMLDivElement>(null);
 
-  // Close dropdowns on outside click
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
       if (
@@ -342,22 +360,58 @@ export default function QmbEnvInvestigationPage() {
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
-  // Load saved records from localStorage
-  useEffect(() => {
+  // Fetch 100% from Supabase Database
+  const fetchFromSupabase = useCallback(async (updateNextNo = true) => {
+    if (!supabase) {
+      setCloudConnected(false);
+      setCloudErrorMsg(
+        "Variabel NEXT_PUBLIC_SUPABASE_URL / ANON_KEY belum dikonfigurasi."
+      );
+      return;
+    }
+
+    setLoadingCloud(true);
+    setCloudErrorMsg(null);
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const parsed: InvestigationRecord[] = JSON.parse(raw);
-        setHistory(parsed);
-        const nextNum = String(parsed.length + 1).padStart(3, "0");
-        setReportNo(`INV-ENV-2026-${nextNum}`);
+      const { data, error } = await supabase
+        .from("investigation_reports")
+        .select("id, report_no, payload, created_at")
+        .order("created_at", { ascending: false });
+
+      if (error) throw error;
+
+      setCloudConnected(true);
+
+      const cloudRecords: InvestigationRecord[] = (data || [])
+        .map((row) => {
+          const payload = row.payload as InvestigationRecord | null;
+          if (!payload) return null;
+          return {
+            ...payload,
+            id: row.id || payload.id,
+          };
+        })
+        .filter((item): item is InvestigationRecord => item !== null);
+
+      setHistory(cloudRecords);
+      if (updateNextNo) {
+        setReportNo(getNextReportNoFromRecords(cloudRecords));
       }
-    } catch {
-      // ignore storage errors
+    } catch (err: unknown) {
+      console.error("Supabase fetch error:", err);
+      setCloudConnected(false);
+      const message =
+        err instanceof Error ? err.message : "Gagal terhubung ke Supabase";
+      setCloudErrorMsg(message);
+    } finally {
+      setLoadingCloud(false);
     }
   }, []);
 
-  // Calculate dynamic visual box photo height based on max vertically stacked photos (0..3)
+  useEffect(() => {
+    fetchFromSupabase(true);
+  }, [fetchFromSupabase]);
+
   const maxPhotosInColumn = Math.max(
     sourcePhotos.length,
     impactedPhotos.length,
@@ -374,8 +428,8 @@ export default function QmbEnvInvestigationPage() {
   const dynamicVisualSectionHeight =
     SEC2_BANNER_HEIGHT + 22 + visualPhotoAreaHeight + 24;
 
-// Dynamic A4 Pagination Engine
-const computePagination = useCallback(() => {
+  // Dynamic A4 Pagination Engine
+  const computePagination = useCallback(() => {
     const rawChronoLines = chronology ? chronology.split("\n") : [];
     const rawRootLines = rootCause ? rootCause.split("\n") : [];
 
@@ -556,7 +610,7 @@ const computePagination = useCallback(() => {
         }
       }
 
-      // 6. Approval Section (dijamin selalu ikut dirender meskipun terdorong ke halaman berikutnya)
+      // 6. Approval Section
       const allContentDone =
         cIdx >= rawChronoLines.length &&
         measDone &&
@@ -588,7 +642,7 @@ const computePagination = useCallback(() => {
     capaRows.length,
     dynamicVisualSectionHeight,
   ]);
-  
+
   useLayoutEffect(() => {
     computePagination();
   }, [computePagination]);
@@ -605,7 +659,6 @@ const computePagination = useCallback(() => {
     }
   };
 
-  // Image compression helper (max 3 photos stacked vertically per visual column)
   const handleCategoryPhotoUpload = (
     files: FileList | null,
     currentList: string[],
@@ -716,7 +769,7 @@ const computePagination = useCallback(() => {
     ]);
     setPreparedBy({
       signatureId: "sukardi-syam",
-      name: "Sukardi Syam",
+      name: "SUKARDI SYAM 卡尔迪",
       position: "Foreman / 班长",
       date: today,
     });
@@ -735,9 +788,8 @@ const computePagination = useCallback(() => {
   };
 
   const resetForm = () => {
-    const nextNum = String(history.length + 1).padStart(3, "0");
     const today = getTodayDotDate();
-    setReportNo(`INV-ENV-2026-${nextNum}`);
+    setReportNo(getNextReportNoFromRecords(history));
     setDateTime(getDefaultDateTime());
     setIncidentLocation("");
     setRelatedDepartment("");
@@ -760,7 +812,15 @@ const computePagination = useCallback(() => {
     setSigErrors({});
   };
 
-  const handleSaveToHistory = () => {
+  // Save 100% directly to Supabase Storage + Supabase Database
+  const handleSaveToSupabase = async () => {
+    if (!supabase) {
+      alert(
+        "Koneksi Supabase belum aktif. Pastikan NEXT_PUBLIC_SUPABASE_URL dan NEXT_PUBLIC_SUPABASE_ANON_KEY sudah diatur."
+      );
+      return;
+    }
+
     if (!reportNo.trim() || !chronology.trim()) {
       alert(
         "Mohon isi minimal No. Laporan dan Kronologi Kejadian sebelum menyimpan. / 保存前请至少填写报告编号和事件经过。"
@@ -768,39 +828,95 @@ const computePagination = useCallback(() => {
       return;
     }
 
-    const record: InvestigationRecord = {
-      id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
-      reportNo: reportNo.trim(),
-      dateTime,
-      incidentLocation,
-      relatedDepartment,
-      investigationTeam,
-      reportStatus,
-      chronology,
-      hasMeasurements,
-      measurements,
-      rootCause,
-      sourcePhotos,
-      sourceCaption,
-      impactedPhotos,
-      impactedCaption,
-      postActionPhotos,
-      postActionCaption,
-      capaRows,
-      preparedBy,
-      checkedBy,
-      approvedBy,
-      createdAt: new Date().toISOString(),
-    };
+    setSaving(true);
+    setCloudErrorMsg(null);
+    const cleanReportNo = reportNo.trim();
 
-    const updated = [
-      record,
-      ...history.filter((item) => item.reportNo !== record.reportNo),
-    ];
-    setHistory(updated);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
-    setSavedToast(true);
-    setTimeout(() => setSavedToast(false), 2500);
+    try {
+      // 1. Upload all new base64 photos strictly to Supabase Storage
+      const [finalSourcePhotos, finalImpactedPhotos, finalPostActionPhotos] =
+        await Promise.all([
+          Promise.all(
+            sourcePhotos.map((src) =>
+              uploadPhotoToSupabase(src, "investigation")
+            )
+          ),
+          Promise.all(
+            impactedPhotos.map((src) =>
+              uploadPhotoToSupabase(src, "investigation")
+            )
+          ),
+          Promise.all(
+            postActionPhotos.map((src) =>
+              uploadPhotoToSupabase(src, "investigation")
+            )
+          ),
+        ]);
+
+      setSourcePhotos(finalSourcePhotos);
+      setImpactedPhotos(finalImpactedPhotos);
+      setPostActionPhotos(finalPostActionPhotos);
+
+      const existingItem = history.find(
+        (item) => item.reportNo === cleanReportNo
+      );
+
+      const record: InvestigationRecord = {
+        id:
+          existingItem?.id ||
+          (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())),
+        reportNo: cleanReportNo,
+        dateTime,
+        incidentLocation,
+        relatedDepartment,
+        investigationTeam,
+        reportStatus,
+        chronology,
+        hasMeasurements,
+        measurements,
+        rootCause,
+        sourcePhotos: finalSourcePhotos,
+        sourceCaption,
+        impactedPhotos: finalImpactedPhotos,
+        impactedCaption,
+        postActionPhotos: finalPostActionPhotos,
+        postActionCaption,
+        capaRows,
+        preparedBy,
+        checkedBy,
+        approvedBy,
+        createdAt: existingItem?.createdAt || new Date().toISOString(),
+      };
+
+      // 2. Upsert strictly to Supabase Table
+      const { error } = await supabase.from("investigation_reports").upsert(
+        {
+          report_no: cleanReportNo,
+          date_time: dateTime,
+          incident_location: incidentLocation,
+          related_department: relatedDepartment,
+          report_status: reportStatus,
+          payload: record,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "report_no" }
+      );
+
+      if (error) throw error;
+
+      setCloudConnected(true);
+      await fetchFromSupabase(false);
+      setSavedToast("Tersimpan ke Supabase! / 已保存到云端！");
+      setTimeout(() => setSavedToast(null), 3000);
+    } catch (err: unknown) {
+      console.error("Supabase save error:", err);
+      const message =
+        err instanceof Error ? err.message : "Gagal menyimpan ke Supabase.";
+      setCloudErrorMsg(message);
+      alert(`Gagal menyimpan ke database Supabase:\n${message}`);
+    } finally {
+      setSaving(false);
+    }
   };
 
   const loadRecord = (rec: InvestigationRecord) => {
@@ -832,10 +948,34 @@ const computePagination = useCallback(() => {
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
-  const deleteRecord = (id: string) => {
-    const updated = history.filter((item) => item.id !== id);
-    setHistory(updated);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
+  const deleteRecord = async (rec: InvestigationRecord) => {
+    if (!supabase) {
+      alert("Koneksi Supabase belum aktif.");
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Hapus laporan ${rec.reportNo} secara permanen dari database? / 确定要从数据库永久删除报告 ${rec.reportNo} 吗？`
+    );
+    if (!confirmed) return;
+
+    try {
+      const { error } = await supabase
+        .from("investigation_reports")
+        .delete()
+        .eq("report_no", rec.reportNo);
+
+      if (error) throw error;
+
+      setHistory((prev) =>
+        prev.filter((item) => item.reportNo !== rec.reportNo)
+      );
+    } catch (err: unknown) {
+      console.error("Supabase delete error:", err);
+      const message =
+        err instanceof Error ? err.message : "Gagal menghapus data.";
+      alert(`Gagal menghapus dari Supabase:\n${message}`);
+    }
   };
 
   const handleExportPNG = async () => {
@@ -984,7 +1124,6 @@ ${rootCause || "-"}
     alignItems: "center",
   };
 
-  // Render Visual Box WITHOUT internal vertical divider, supporting up to 3 vertically stacked photos
   const renderVisualBox = (
     photos: string[],
     caption: string,
@@ -1020,6 +1159,7 @@ ${rootCause || "-"}
             <img
               src={src}
               alt={`${labelPrefix} ${idx + 1}`}
+              crossOrigin={src.startsWith("http") ? "anonymous" : undefined}
               style={{
                 maxWidth: "100%",
                 maxHeight: "106px",
@@ -1050,10 +1190,7 @@ ${rootCause || "-"}
     </div>
   );
 
-  const renderSignOffColumn = (
-    info: SignOffInfo,
-    isLastColumn: boolean
-  ) => {
+  const renderSignOffColumn = (info: SignOffInfo, isLastColumn: boolean) => {
     const sup = ALL_SIGNERS.find((s) => s.id === info.signatureId);
     return (
       <div
@@ -1063,7 +1200,6 @@ ${rootCause || "-"}
           flexDirection: "column",
         }}
       >
-        {/* Signature Area */}
         <div
           style={{
             height: "50px",
@@ -1096,7 +1232,6 @@ ${rootCause || "-"}
             ))}
         </div>
 
-        {/* Nama (姓名) */}
         <div
           style={{
             display: "grid",
@@ -1130,7 +1265,6 @@ ${rootCause || "-"}
           </div>
         </div>
 
-        {/* Jabatan (职位) */}
         <div
           style={{
             display: "grid",
@@ -1163,7 +1297,6 @@ ${rootCause || "-"}
           </div>
         </div>
 
-        {/* Tanggal (日期) */}
         <div
           style={{
             display: "grid",
@@ -1261,7 +1394,6 @@ ${rootCause || "-"}
               </h2>
             </div>
 
-            {/* Isi Contoh Data & Reset Cepat Bersebelahan Rapi */}
             <div className="flex items-center gap-2">
               <button
                 type="button"
@@ -1285,9 +1417,36 @@ ${rootCause || "-"}
           <div className="p-5 space-y-6">
             {/* 1. IDENTITAS KEJADIAN */}
             <div className="p-4 rounded-xl bg-[#FFFDF8] border border-[#5DA295]/25 space-y-4">
-              <div className="text-xs font-bold uppercase tracking-wider text-[#3e776c]">
-                1. Identitas Kejadian / 基本信息
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs font-bold uppercase tracking-wider text-[#3e776c]">
+                  1. Identitas Kejadian / 基本信息
+                </span>
+                <span
+                  className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-semibold ${
+                    cloudConnected
+                      ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                      : "bg-rose-50 text-rose-700 border border-rose-200"
+                  }`}
+                >
+                  {cloudConnected ? (
+                    <>
+                      <Cloud className="w-3 h-3" />
+                      100% Supabase Cloud Terhubung
+                    </>
+                  ) : (
+                    <>
+                      <CloudOff className="w-3 h-3" />
+                      Supabase Terputus / Belum Terkonfigurasi
+                    </>
+                  )}
+                </span>
               </div>
+
+              {cloudErrorMsg && (
+                <div className="p-2.5 rounded-lg bg-rose-50 border border-rose-200 text-rose-700 text-xs">
+                  <strong>Status Koneksi Database:</strong> {cloudErrorMsg}
+                </div>
+              )}
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
@@ -1546,7 +1705,7 @@ ${rootCause || "-"}
                 />
               </div>
 
-              {/* 2.2 Data Pengukuran Lapangan (Opsi Isi / Kosongkan, Default 1 Baris) */}
+              {/* 2.2 Data Pengukuran Lapangan */}
               <div className="space-y-2">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <label className="block text-xs font-semibold text-slate-700">
@@ -1707,7 +1866,8 @@ ${rootCause || "-"}
                   </div>
                 ) : (
                   <div className="px-3 py-2.5 rounded-xl border border-dashed border-slate-300 bg-white text-xs text-slate-500">
-                    Bagian pengukuran lapangan dikosongkan (tidak ada pengukuran parameter lingkungan). / 现场监测数据已选择留空。
+                    Bagian pengukuran lapangan dikosongkan (tidak ada pengukuran
+                    parameter lingkungan). / 现场监测数据已选择留空。
                   </div>
                 )}
               </div>
@@ -1726,10 +1886,11 @@ ${rootCause || "-"}
               </div>
             </div>
 
-            {/* 3. DOKUMENTASI VISUAL LAPANGAN (3 Kategori x Maks. 3 Foto Bersusun ke Bawah) */}
+            {/* 3. DOKUMENTASI VISUAL LAPANGAN */}
             <div className="p-4 rounded-xl bg-[#FFFDF8] border border-[#5DA295]/25 space-y-4">
               <div className="text-xs font-bold uppercase tracking-wider text-[#3e776c]">
-                3. Dokumentasi Visual Lapangan / 现场影像记录 (Maks. 3 Foto Bersusun per Kategori)
+                3. Dokumentasi Visual Lapangan / 现场影像记录 (Maks. 3 Foto
+                Bersusun per Kategori)
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -1942,7 +2103,7 @@ ${rootCause || "-"}
               </div>
             </div>
 
-            {/* 4. TINDAK LANJUT (CAPA) & PENGESAHAN (Default 1 Baris Tindakan) */}
+            {/* 4. TINDAK LANJUT (CAPA) & PENGESAHAN */}
             <div className="p-4 rounded-xl bg-[#FFFDF8] border border-[#5DA295]/25 space-y-5">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-bold uppercase tracking-wider text-[#3e776c]">
@@ -1963,7 +2124,7 @@ ${rootCause || "-"}
                 </button>
               </div>
 
-              {/* CAPA Table (Default 1 Row) */}
+              {/* CAPA Table */}
               <div className="overflow-x-auto border border-slate-200 rounded-xl bg-white">
                 <table className="w-full text-xs border-collapse">
                   <thead>
@@ -2059,7 +2220,6 @@ ${rootCause || "-"}
 
               {/* 3 Kolom Pengesahan */}
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                {/* Dibuat Oleh */}
                 <div className="p-3 bg-white rounded-xl border border-slate-200 space-y-2">
                   <div className="text-xs font-bold text-slate-800 border-b border-slate-100 pb-1.5">
                     Dibuat Oleh (编制人)
@@ -2110,7 +2270,6 @@ ${rootCause || "-"}
                   />
                 </div>
 
-                {/* Diperiksa Oleh */}
                 <div className="p-3 bg-white rounded-xl border border-slate-200 space-y-2">
                   <div className="text-xs font-bold text-slate-800 border-b border-slate-100 pb-1.5">
                     Diperiksa Oleh (审核人)
@@ -2161,7 +2320,6 @@ ${rootCause || "-"}
                   />
                 </div>
 
-                {/* Disetujui Oleh */}
                 <div className="p-3 bg-white rounded-xl border border-slate-200 space-y-2">
                   <div className="text-xs font-bold text-slate-800 border-b border-slate-100 pb-1.5">
                     Disetujui Oleh (批准人)
@@ -2221,17 +2379,20 @@ ${rootCause || "-"}
           <div className="bg-white p-4 rounded-2xl border border-[#5DA295]/25 shadow-sm flex flex-wrap items-center justify-between gap-3">
             <button
               type="button"
-              onClick={handleSaveToHistory}
-              className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-[#5DA295] hover:bg-[#4c8b7f] text-white text-xs font-bold shadow-xs transition cursor-pointer"
+              onClick={handleSaveToSupabase}
+              disabled={saving || !cloudConnected}
+              className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-[#5DA295] hover:bg-[#4c8b7f] text-white text-xs font-bold shadow-xs transition cursor-pointer disabled:opacity-60"
             >
               {savedToast ? (
                 <Check className="w-4 h-4" />
               ) : (
                 <Save className="w-4 h-4" />
               )}
-              {savedToast
-                ? "Tersimpan! / 已保存！"
-                : "Simpan ke Riwayat / 保存记录"}
+              {saving
+                ? "Mengunggah & Menyimpan... / 正在保存..."
+                : savedToast
+                ? savedToast
+                : "Simpan ke Supabase / 保存到云端"}
             </button>
 
             <div className="flex flex-wrap items-center gap-2.5">
@@ -2289,7 +2450,6 @@ ${rootCause || "-"}
                   </span>
                 </div>
 
-                {/* Locked A4 Sheet */}
                 <div
                   ref={(el) => {
                     pageRefs.current[idx] = el;
@@ -2477,7 +2637,8 @@ ${rootCause || "-"}
                                   fontWeight: 700,
                                 }}
                               >
-                                LAPORAN INVESTIGASI KHUSUS INSIDEN / TEMUAN LINGKUNGAN
+                                LAPORAN INVESTIGASI KHUSUS INSIDEN / TEMUAN
+                                LINGKUNGAN
                               </div>
                               <div
                                 style={{
@@ -2871,7 +3032,8 @@ ${rootCause || "-"}
                                   boxSizing: "border-box",
                                 }}
                               >
-                                Tidak dilakukan pengukuran parameter lingkungan / 未进行现场环境参数监测
+                                Tidak dilakukan pengukuran parameter lingkungan /
+                                未进行现场环境参数监测
                               </div>
                             )}
                           </>
@@ -2916,7 +3078,6 @@ ${rootCause || "-"}
                             border: "1px solid #000000",
                           }}
                         >
-                          {/* Column 1 */}
                           <div style={{ borderRight: "1px solid #000000" }}>
                             <div
                               style={{
@@ -2935,7 +3096,6 @@ ${rootCause || "-"}
                             )}
                           </div>
 
-                          {/* Column 2 */}
                           <div style={{ borderRight: "1px solid #000000" }}>
                             <div
                               style={{
@@ -2954,7 +3114,6 @@ ${rootCause || "-"}
                             )}
                           </div>
 
-                          {/* Column 3 */}
                           <div>
                             <div
                               style={{
@@ -3016,7 +3175,8 @@ ${rootCause || "-"}
                                     padding: "1px 4px 4px 4px",
                                   }}
                                 >
-                                  Tindakan Perbaikan & Pencegahan (纠正与预防措施)
+                                  Tindakan Perbaikan & Pencegahan
+                                  (纠正与预防措施)
                                 </th>
                                 <th
                                   style={{
@@ -3102,7 +3262,6 @@ ${rootCause || "-"}
 
                         {slice.showApprovalSection && (
                           <div style={{ border: "1px solid #000000" }}>
-                            {/* 3 Header Columns */}
                             <div
                               style={{
                                 display: "grid",
@@ -3133,7 +3292,6 @@ ${rootCause || "-"}
                               </div>
                             </div>
 
-                            {/* 3 Sign-Off Columns */}
                             <div
                               style={{
                                 display: "grid",
@@ -3155,15 +3313,27 @@ ${rootCause || "-"}
           </div>
         </section>
 
-        {/* SECTION 3 (BOTTOM): Riwayat Laporan Investigasi Lokal */}
+        {/* SECTION 3 (BOTTOM): Riwayat Laporan Investigasi 100% Supabase */}
         <section className="bg-white rounded-2xl border border-[#5DA295]/25 shadow-sm overflow-hidden">
           <div className="px-5 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
             <div className="flex items-center gap-2">
               <FolderOpen className="w-5 h-5 text-[#5DA295]" />
               <h3 className="font-bold text-slate-900 text-sm sm:text-base">
-                Riwayat Laporan Investigasi (Lokal) / 本地已保存调查报告 (
+                Riwayat Laporan Investigasi (Supabase Cloud) / 云端已保存调查报告 (
                 {filteredHistory.length})
               </h3>
+              <button
+                type="button"
+                onClick={() => fetchFromSupabase(false)}
+                disabled={loadingCloud}
+                title="Muat ulang data dari Supabase"
+                className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-[11px] font-semibold cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw
+                  className={`w-3 h-3 ${loadingCloud ? "animate-spin" : ""}`}
+                />
+                Refresh
+              </button>
             </div>
 
             <div className="relative">
@@ -3178,9 +3348,15 @@ ${rootCause || "-"}
             </div>
           </div>
 
-          {filteredHistory.length === 0 ? (
+          {loadingCloud && filteredHistory.length === 0 ? (
             <div className="p-8 text-center text-xs text-slate-500">
-              Belum ada laporan investigasi tersimpan. Klik &ldquo;Simpan ke Riwayat / 保存记录&rdquo; untuk menyimpan. / 暂无保存记录。
+              Mengambil data dari database Supabase... / 正在从云端加载记录...
+            </div>
+          ) : filteredHistory.length === 0 ? (
+            <div className="p-8 text-center text-xs text-slate-500">
+              Belum ada laporan investigasi di database Supabase. Klik
+              &ldquo;Simpan ke Supabase / 保存到云端&rdquo; untuk menyimpan. /
+              云端暂无保存记录。
             </div>
           ) : (
             <div className="overflow-x-auto">
@@ -3229,7 +3405,7 @@ ${rootCause || "-"}
                         </button>
                         <button
                           type="button"
-                          onClick={() => deleteRecord(item.id)}
+                          onClick={() => deleteRecord(item)}
                           className="px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 font-semibold cursor-pointer"
                         >
                           Hapus / 删除
